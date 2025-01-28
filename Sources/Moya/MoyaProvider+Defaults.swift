@@ -24,6 +24,11 @@ public extension MoyaProvider {
             closure(.failure(MoyaError.underlying(error, nil)))
         }
     }
+    
+    final class func defaultAsyncRequestMapping(for endpoint: Endpoint) throws -> URLRequest {
+        let urlRequest = try endpoint.urlRequest()
+        return urlRequest
+    }
 
     final class func defaultAlamofireSession() -> Session {
         let configuration = URLSessionConfiguration.default

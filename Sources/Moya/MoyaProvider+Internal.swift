@@ -1,4 +1,5 @@
 import Foundation
+import Alamofire
 
 // MARK: - Method
 
@@ -18,6 +19,27 @@ public extension Method {
 
 /// Internal extension to keep the inner-workings outside the main Moya.swift file.
 public extension MoyaProvider {
+    
+    /// Performs normal requests using native swift concurrency.
+    func requestNormal(_ target: Target) async throws -> Moya.Response {
+        
+        let endpoint = self.endpoint(target)
+        
+        let stubBehavior = self.stubClosure(target)
+        
+        let requestMapping = try MoyaProvider.defaultAsyncRequestMapping(for: endpoint)
+        
+        let performedRequest = try await performRequest(
+            target,
+            request: requestMapping,
+            endpoint: endpoint
+        )
+        
+        
+        return performedRequest
+        
+    }
+    
     /// Performs normal requests.
     func requestNormal(_ target: Target, callbackQueue: DispatchQueue?, progress: Moya.ProgressBlock?, completion: @escaping Moya.Completion) -> Cancellable {
         let endpoint = self.endpoint(target)
@@ -103,6 +125,37 @@ public extension MoyaProvider {
             return self.stubRequest(target, request: request, callbackQueue: callbackQueue, completion: completion, endpoint: endpoint, stubBehavior: stubBehavior)
         }
     }
+    
+    private func performRequest(
+        _ target: Target,
+        request: URLRequest,
+        endpoint: Endpoint
+    ) async throws -> Moya.Response {
+        
+        let onSendUploadMultipart: (MultipartFormData) async throws -> Moya.Response = { multipartFormData in
+            guard !multipartFormData.parts.isEmpty && endpoint.method.supportsMultipart else {
+                fatalError("\(target) is not a multipart upload target.")
+            }
+            
+            return try await self.sendUploadMultipart(target, request: request, multipartFormData: multipartFormData)
+        }
+        
+        switch endpoint.task {
+            case .requestPlain, .requestData, .requestJSONEncodable,
+                    .requestCustomJSONEncodable, .requestParameters, .requestCompositeData,
+                    .requestCompositeParameters:
+                return try await self.sendRequest(target, request: request)
+            case .uploadFile(let file):
+                return try await self.sendUploadFile(target, request: request, file: file)
+            case .uploadMultipartFormData(let multipartFormData), .uploadCompositeMultipartFormData(let multipartFormData, _):
+                return try await onSendUploadMultipart(multipartFormData)
+            case .uploadMultipart(let multipartFormBodyParts), .uploadCompositeMultipart(let multipartFormBodyParts, _):
+                return try await onSendUploadMultipart(MultipartFormData(parts: multipartFormBodyParts))
+            case .downloadDestination(let destination), .downloadParameters(parameters: _, encoding: _, let destination):
+                return try await self.sendDownloadRequest(target, request: request, destination: destination)
+        }
+        
+    }
 
     func cancelCompletion(_ completion: Moya.Completion, target: Target) {
         let error = MoyaError.underlying(NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled, userInfo: nil), nil)
@@ -164,6 +217,27 @@ public extension MoyaProvider {
 }
 
 private extension MoyaProvider {
+    
+    private func interceptRequest(request: URLRequest, with target: Target) async throws -> URLRequest {
+        let preparedResult = try await asyncPlugins.asyncReduce(request) {
+            try await $1.prepare($0, target: target)
+        }
+        return preparedResult
+    }
+    
+    private func setup(
+        urlRequest: URLRequest,
+        with target: Target
+    ) async throws -> URLRequest {
+        
+        let preparedRequest = try await interceptRequest(request: urlRequest, with: target)
+
+        self.asyncPlugins.forEach { $0.willSend(urlRequest, target: target) }
+        
+        return preparedRequest
+    }
+    
+    
     private func interceptor(target: Target) -> MoyaRequestInterceptor {
         return MoyaRequestInterceptor(prepare: { [weak self] urlRequest in
             return self?.plugins.reduce(urlRequest) { $1.prepare($0, target: target) } ?? urlRequest
@@ -195,6 +269,34 @@ private extension MoyaProvider {
         let validatedRequest = validationCodes.isEmpty ? uploadRequest : uploadRequest.validate(statusCode: validationCodes)
         return sendAlamofireRequest(validatedRequest, target: target, callbackQueue: callbackQueue, progress: progress, completion: completion)
     }
+    
+    func sendUploadMultipart(_ target: Target, request: URLRequest, multipartFormData: MultipartFormData) async throws -> Moya.Response {
+        
+        let formData = RequestMultipartFormData(
+            fileManager: multipartFormData.fileManager,
+            boundary: multipartFormData.boundary
+        )
+        
+        let preparedRequest = try await setup(urlRequest: request, with: target)
+        
+        let uploadRequest: UploadRequest = AF.upload(multipartFormData: formData, with: preparedRequest)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            sendAlamofireRequest(
+                uploadRequest,
+                target: target,
+                callbackQueue: nil,
+                progress: nil
+            ) { result in
+                switch result {
+                    case .success(let response):
+                        continuation.resume(returning: response)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 
     func sendUploadFile(_ target: Target, request: URLRequest, callbackQueue: DispatchQueue?, file: URL, progress: ProgressBlock? = nil, completion: @escaping Completion) -> CancellableToken {
         let interceptor = self.interceptor(target: target)
@@ -208,6 +310,25 @@ private extension MoyaProvider {
         let validationCodes = target.validationType.statusCodes
         let alamoRequest = validationCodes.isEmpty ? uploadRequest : uploadRequest.validate(statusCode: validationCodes)
         return sendAlamofireRequest(alamoRequest, target: target, callbackQueue: callbackQueue, progress: progress, completion: completion)
+    }
+    
+    func sendUploadFile(_ target: Target, request: URLRequest, file: URL) async throws -> Moya.Response {
+        
+        let preparedRequest = try await setup(urlRequest: request, with: target)
+        
+        let uploadRequest = Session().upload(file, with: request, interceptor: nil)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            sendAlamofireRequest(uploadRequest, target: target, callbackQueue: nil, progress: nil) { result in
+                switch result {
+                    case .success(let response):
+                        continuation.resume(returning: response)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                }
+            }
+        }
+        
     }
 
     func sendDownloadRequest(_ target: Target, request: URLRequest, callbackQueue: DispatchQueue?, destination: @escaping DownloadDestination, progress: ProgressBlock? = nil, completion: @escaping Completion) -> CancellableToken {
@@ -223,6 +344,24 @@ private extension MoyaProvider {
         let alamoRequest = validationCodes.isEmpty ? downloadRequest : downloadRequest.validate(statusCode: validationCodes)
         return sendAlamofireRequest(alamoRequest, target: target, callbackQueue: callbackQueue, progress: progress, completion: completion)
     }
+    
+    func sendDownloadRequest(_ target: Target, request: URLRequest, destination: @escaping DownloadDestination) async throws -> Moya.Response {
+        
+        let preparedRequest = try await setup(urlRequest: request, with: target)
+        
+        let downloadRequest =  AF.download(preparedRequest)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            sendAlamofireRequest(downloadRequest, target: target, callbackQueue: nil, progress: nil) { result in
+                switch result {
+                    case .success(let response):
+                        continuation.resume(returning: response)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 
     func sendRequest(_ target: Target, request: URLRequest, callbackQueue: DispatchQueue?, progress: Moya.ProgressBlock?, completion: @escaping Moya.Completion) -> CancellableToken {
         let interceptor = self.interceptor(target: target)
@@ -237,8 +376,28 @@ private extension MoyaProvider {
         let alamoRequest = validationCodes.isEmpty ? initialRequest : initialRequest.validate(statusCode: validationCodes)
         return sendAlamofireRequest(alamoRequest, target: target, callbackQueue: callbackQueue, progress: progress, completion: completion)
     }
+    
+    
+    func sendRequest(_ target: Target, request: URLRequest) async throws -> Moya.Response {
+        
+        let preparedRequest = try await setup(urlRequest: request, with: target)
+        
+        let alamoRequest =  AF.request(preparedRequest)
+        
+        return try await withCheckedThrowingContinuation { continuation in
+            sendAlamofireRequest(alamoRequest, target: target, callbackQueue: nil, progress: nil) { result in
+                switch result {
+                    case .success(let response):
+                        continuation.resume(returning: response)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 
     // swiftlint:disable:next cyclomatic_complexity
+    @discardableResult
     func sendAlamofireRequest<T>(_ alamoRequest: T, target: Target, callbackQueue: DispatchQueue?, progress progressCompletion: Moya.ProgressBlock?, completion: @escaping Moya.Completion) -> CancellableToken where T: Requestable, T: Request {
         // Give plugins the chance to alter the outgoing request
         let plugins = self.plugins

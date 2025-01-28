@@ -78,6 +78,8 @@ open class MoyaProvider<Target: TargetType>: MoyaProviderType {
     /// A list of plugins.
     /// e.g. for logging, network activity indicator or credentials.
     public let plugins: [PluginType]
+    
+    public let asyncPlugins: [AsyncPluginType]
 
     public let trackInflights: Bool
 
@@ -98,6 +100,7 @@ open class MoyaProvider<Target: TargetType>: MoyaProviderType {
                 callbackQueue: DispatchQueue? = nil,
                 session: Session = MoyaProvider<Target>.defaultAlamofireSession(),
                 plugins: [PluginType] = [],
+                asyncPlugins: [AsyncPluginType] = [],
                 trackInflights: Bool = false) {
 
         self.endpointClosure = endpointClosure
@@ -105,6 +108,7 @@ open class MoyaProvider<Target: TargetType>: MoyaProviderType {
         self.stubClosure = stubClosure
         self.session = session
         self.plugins = plugins
+        self.asyncPlugins = asyncPlugins
         self.trackInflights = trackInflights
         self.callbackQueue = callbackQueue
     }
