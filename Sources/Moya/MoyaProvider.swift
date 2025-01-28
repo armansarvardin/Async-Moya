@@ -128,6 +128,13 @@ open class MoyaProvider<Target: TargetType>: MoyaProviderType {
         let callbackQueue = callbackQueue ?? self.callbackQueue
         return requestNormal(target, callbackQueue: callbackQueue, progress: progress, completion: completion)
     }
+    
+    @discardableResult
+    open func request(
+        _ target: Target
+    ) async throws -> Moya.Response {
+        return try await requestNormal(target)
+    }
 
     // swiftlint:disable function_parameter_count
     /// When overriding this method, call `notifyPluginsOfImpendingStub` to prepare your request
