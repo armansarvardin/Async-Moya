@@ -276,6 +276,7 @@ private extension MoyaProvider {
             fileManager: multipartFormData.fileManager,
             boundary: multipartFormData.boundary
         )
+        formData.applyMoyaMultipartFormData(multipartFormData)
         
         let preparedRequest = try await setup(urlRequest: request, with: target)
         
